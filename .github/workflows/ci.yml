@@ -105,9 +105,10 @@ jobs:
         uses: pypa/cibuildwheel@v2.21.1
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         if: github.event_name == 'release' && github.event.action == 'published'
         with:
+          name: artifact-wheels
           path: ./wheelhouse/*.whl
 
   build_sdist:
@@ -127,8 +128,9 @@ jobs:
         run: python setup.py sdist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
+          name: artifact-sdist
           path: dist/*.tar.gz
 
   upload_pypi:
@@ -136,10 +138,11 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'published'
     steps:
-      - uses: actions/download-artifact@v2
+      - uses: actions/download-artifact@v4
         with:
-          name: artifact
+          merge-multiple: true
           path: dist
+          pattern: artifact-*
 
       - uses: pypa/gh-action-pypi-publish@master
         with:
