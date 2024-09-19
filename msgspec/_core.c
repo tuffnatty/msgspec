@@ -2139,7 +2139,16 @@ PyTypeObject NoDefault_Type = {
 #if PY312_PLUS
 PyObject _NoDefault_Object = {
     _PyObject_EXTRA_INIT
+#if defined(Py_GIL_DISABLED)
+    0,
+    0,
+    { 0 },
+    0,
+    _Py_IMMORTAL_REFCNT_LOCAL,
+    0,
+#else
     { _Py_IMMORTAL_REFCNT },
+#endif
     &NoDefault_Type
 };
 #else
@@ -2243,7 +2252,16 @@ PyTypeObject Unset_Type = {
 #if PY312_PLUS
 PyObject _Unset_Object = {
     _PyObject_EXTRA_INIT
+#if defined(Py_GIL_DISABLED)
+    0,
+    0,
+    { 0 },
+    0,
+    _Py_IMMORTAL_REFCNT_LOCAL,
+    0,
+#else
     { _Py_IMMORTAL_REFCNT },
+#endif
     &Unset_Type
 };
 #else
@@ -22273,5 +22291,8 @@ PyInit__core(void)
     Py_INCREF(st->StructType);
     if (PyModule_AddObject(m, "Struct", st->StructType) < 0) return NULL;
 
+#ifdef Py_GIL_DISABLED
+    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
+#endif
     return m;
 }
