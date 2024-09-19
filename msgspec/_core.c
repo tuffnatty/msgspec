@@ -9396,6 +9396,9 @@ encoder_encode_into_common(
         }
     }
 
+    Py_INCREF(obj);
+    Py_INCREF(buf);
+
     /* Setup buffer */
     EncoderState state = {
         .mod = self->mod,
@@ -9410,9 +9413,13 @@ encoder_encode_into_common(
         .resize_buffer = ms_resize_bytearray
     };
     if (encode(&state, obj) < 0) {
+        Py_DECREF(buf);
+        Py_DECREF(obj);
         return NULL;
     }
     FAST_BYTEARRAY_SHRINK(buf, state.output_len);
+    Py_DECREF(buf);
+    Py_DECREF(obj);
     Py_RETURN_NONE;
 }
 
@@ -9456,10 +9463,13 @@ encoder_encode_common(
     if (state.output_buffer == NULL) return NULL;
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
+    Py_INCREF(args[0]);
     if (encode(&state, args[0]) < 0) {
+        Py_DECREF(args[0]);
         Py_DECREF(state.output_buffer);
         return NULL;
     }
+    Py_DECREF(args[0]);
     FAST_BYTES_SHRINK(state.output_buffer, state.output_len);
     return state.output_buffer;
 }
@@ -9516,10 +9526,13 @@ encode_common(
     if (state.output_buffer == NULL) return NULL;
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
+    Py_INCREF(args[0]);
     if (encode(&state, args[0]) < 0) {
+        Py_DECREF(args[0]);
         Py_DECREF(state.output_buffer);
         return NULL;
     }
+    Py_DECREF(args[0]);
     FAST_BYTES_SHRINK(state.output_buffer, state.output_len);
     return state.output_buffer;
 }
@@ -14332,6 +14345,7 @@ JSONEncoder_encode_lines(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
     PyObject *input = args[0];
+    Py_INCREF(input);
     if (MS_LIKELY(PyList_Check(input))) {
         for (Py_ssize_t i = 0; i < PyList_GET_SIZE(input); i++) {
             if (json_encode(&state, PyList_GET_ITEM(input, i)) < 0) goto error;
@@ -14349,11 +14363,13 @@ JSONEncoder_encode_lines(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
         }
         if (PyErr_Occurred()) goto error;
     }
+    Py_DECREF(input);
 
     FAST_BYTES_SHRINK(state.output_buffer, state.output_len);
     return state.output_buffer;
 
 error:
+    Py_DECREF(input);
     Py_DECREF(state.output_buffer);
     return NULL;
 }
@@ -16135,6 +16151,7 @@ Decoder_decode(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
 
     Py_buffer buffer;
     buffer.buf = NULL;
+    Py_INCREF(args[0]);
     if (PyObject_GetBuffer(args[0], &buffer, PyBUF_CONTIG_RO) >= 0) {
         state.buffer_obj = args[0];
         state.input_start = buffer.buf;
@@ -16148,8 +16165,10 @@ Decoder_decode(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
         }
 
         PyBuffer_Release(&buffer);
+        Py_DECREF(args[0]);
         return res;
     }
+    Py_DECREF(args[0]);
     return NULL;
 }
 
@@ -16313,6 +16332,7 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
 
     Py_buffer buffer;
     buffer.buf = NULL;
+    Py_INCREF(buf);
     if (PyObject_GetBuffer(buf, &buffer, PyBUF_CONTIG_RO) >= 0) {
         state.buffer_obj = buf;
         state.input_start = buffer.buf;
@@ -16324,6 +16344,7 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
             Py_CLEAR(res);
         }
     }
+    Py_DECREF(buf);
 
     if (state.type == (TypeNode *)&typenode_struct) {
         Py_DECREF(typenode_struct.details[0].pointer);
@@ -19084,6 +19105,7 @@ JSONDecoder_decode(JSONDecoder *self, PyObject *const *args, Py_ssize_t nargs)
 
     Py_buffer buffer;
     buffer.buf = NULL;
+    Py_INCREF(args[0]);
     if (ms_get_buffer(args[0], &buffer) >= 0) {
 
         state.buffer_obj = args[0];
@@ -19100,8 +19122,10 @@ JSONDecoder_decode(JSONDecoder *self, PyObject *const *args, Py_ssize_t nargs)
         ms_release_buffer(&buffer);
 
         PyMem_Free(state.scratch);
+        Py_DECREF(args[0]);
         return res;
     }
+    Py_DECREF(args[0]);
 
     return NULL;
 }
@@ -19151,6 +19175,7 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
 
     Py_buffer buffer;
     buffer.buf = NULL;
+    Py_INCREF(args[0]);
     if (ms_get_buffer(args[0], &buffer) >= 0) {
 
         state.buffer_obj = args[0];
@@ -19161,7 +19186,7 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
         PathNode path = {NULL, 0, NULL};
 
         PyObject *out = PyList_New(0);
-        if (out == NULL) return NULL;
+        if (out == NULL) goto done2;
         while (true) {
             /* Skip until first non-whitespace character, or return if buffer
              * exhausted */
@@ -19195,8 +19220,11 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
         ms_release_buffer(&buffer);
 
         PyMem_Free(state.scratch);
+    done2:
+        Py_DECREF(args[0]);
         return out;
     }
+    Py_DECREF(args[0]);
 
     return NULL;
 }
@@ -19346,6 +19374,7 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
 
     Py_buffer buffer;
     buffer.buf = NULL;
+    Py_INCREF(buf);
     if (ms_get_buffer(buf, &buffer) >= 0) {
         state.buffer_obj = buf;
         state.input_start = buffer.buf;
@@ -19360,6 +19389,7 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
 
         ms_release_buffer(&buffer);
     }
+    Py_DECREF(buf);
 
     PyMem_Free(state.scratch);
 
@@ -20140,7 +20170,9 @@ msgspec_to_builtins(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
+    Py_INCREF(obj);
     PyObject *out = to_builtins(&state, obj, false);
+    Py_DECREF(obj);
     Py_XDECREF(state.builtin_types_seq);
     return out;
 }
@@ -21768,22 +21800,31 @@ msgspec_convert(PyObject *self, PyObject *args, PyObject *kwargs)
     }
     state.dec_hook = dec_hook;
 
+    Py_INCREF(obj);
     /* Avoid allocating a new TypeNode for struct types */
     if (Py_TYPE(pytype) == &StructMetaType) {
         PyObject *info = StructInfo_Convert(pytype);
-        if (info == NULL) return NULL;
+        if (info == NULL) {
+            Py_DECREF(obj);
+            return NULL;
+        }
         bool array_like = ((StructMetaObject *)pytype)->array_like == OPT_TRUE;
         TypeNodeSimple type;
         type.types = array_like ? MS_TYPE_STRUCT_ARRAY : MS_TYPE_STRUCT;
         type.details[0].pointer = info;
         PyObject *out = convert(&state, obj, (TypeNode *)(&type), NULL);
         Py_DECREF(info);
+        Py_DECREF(obj);
         return out;
     }
 
     TypeNode *type = TypeNode_Convert(pytype);
-    if (type == NULL) return NULL;
+    if (type == NULL) {
+        Py_DECREF(obj);
+        return NULL;
+    }
     PyObject *out = convert(&state, obj, type, NULL);
+    Py_DECREF(obj);
     TypeNode_Free(type);
     return out;
 }
