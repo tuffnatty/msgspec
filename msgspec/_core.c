@@ -12467,20 +12467,27 @@ mpack_encode_list(EncoderState *self, PyObject *obj)
     Py_ssize_t i, len;
     int status = 0;
 
-    len = PyList_GET_SIZE(obj);
-    if (len == 0) return mpack_encode_empty_array(self);
-
-    if (mpack_encode_array_header(self, len, "list") < 0) return -1;
-    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
     Py_BEGIN_CRITICAL_SECTION(obj);
+    len = PyList_GET_SIZE(obj);
+    if (len == 0) {
+	EXIT_CRITICAL_SECTION();
+        return mpack_encode_empty_array(self);
+    }
+
+    if (mpack_encode_array_header(self, len, "list") < 0) {
+error:
+	EXIT_CRITICAL_SECTION();
+	return -1;
+    }
+    if (Py_EnterRecursiveCall(" while serializing an object")) goto error;
     for (i = 0; i < len; i++) {
         if (mpack_encode_inline(self, PyList_GET_ITEM(obj, i)) < 0) {
             status = -1;
             break;
         }
     }
-    Py_END_CRITICAL_SECTION();
     Py_LeaveRecursiveCall();
+    Py_END_CRITICAL_SECTION();
     return status;
 }
 
