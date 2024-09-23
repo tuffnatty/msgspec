@@ -22,6 +22,12 @@
 #define PY312_PLUS (PY_VERSION_HEX >= 0x030c0000)
 #define PY313_PLUS (PY_VERSION_HEX >= 0x030d0000)
 
+#ifndef Py_GIL_DISABLED
+    #define EXIT_CRITICAL_SECTION() 0
+#else
+    #define EXIT_CRITICAL_SECTION() {Py_END_CRITICAL_SECTION()
+#endif
+
 /* Hint to the compiler not to store `x` in a register since it is likely to
  * change. Results in much higher performance on GCC, with smaller benefits on
  * clang */
@@ -843,11 +849,12 @@ IntLookup_New(PyObject *arg, PyObject *tag_field, PyObject *cls, bool array_like
 
     /* Find the min/max of items, and error if any item isn't an integer or is
      * out of range */
-#define handle(key) \
+#define handle(key, cleanup_code) \
     do { \
         int overflow = 0; \
         int64_t ival = PyLong_AsLongLongAndOverflow(key, &overflow); \
         if (overflow) { \
+            cleanup_code; \
             PyErr_SetString( \
                 PyExc_NotImplementedError, \
                 "Integer values > (2**63 - 1) are not currently supported for " \
@@ -867,13 +874,15 @@ IntLookup_New(PyObject *arg, PyObject *tag_field, PyObject *cls, bool array_like
     if (PyDict_CheckExact(arg)) {
         PyObject *key, *val;
         Py_ssize_t pos = 0;
+        Py_BEGIN_CRITICAL_SECTION(arg);
         while (PyDict_Next(arg, &pos, &key, &val)) {
-            handle(key);
+            handle(key, EXIT_CRITICAL_SECTION());
         }
+        Py_END_CRITICAL_SECTION();
     }
     else {
         for (Py_ssize_t i = 0; i < nitems; i++) {
-            handle(PyTuple_GET_ITEM(items, i));
+            handle(PyTuple_GET_ITEM(items, i), 0);
         }
     }
 #undef handle
@@ -923,9 +932,11 @@ IntLookup_New(PyObject *arg, PyObject *tag_field, PyObject *cls, bool array_like
         if (PyDict_CheckExact(arg)) {
             PyObject *key, *val;
             Py_ssize_t pos = 0;
+            Py_BEGIN_CRITICAL_SECTION(arg);
             while (PyDict_Next(arg, &pos, &key, &val)) {
                 setitem(key, val);
             }
+            Py_END_CRITICAL_SECTION();
         }
         else {
             for (Py_ssize_t i = 0; i < nitems; i++) {
@@ -966,10 +977,12 @@ IntLookup_New(PyObject *arg, PyObject *tag_field, PyObject *cls, bool array_like
         if (PyDict_CheckExact(arg)) {
             PyObject *key, *val;
             Py_ssize_t pos = 0;
+            Py_BEGIN_CRITICAL_SECTION(arg);
             while (PyDict_Next(arg, &pos, &key, &val)) {
                 int64_t ival = PyLong_AsLongLong(key);
                 _IntLookupHashmap_Set(out, ival, val);
             }
+            Py_END_CRITICAL_SECTION();
         }
         else {
             for (Py_ssize_t i = 0; i < nitems; i++) {
@@ -1199,17 +1212,20 @@ StrLookup_New(PyObject *arg, PyObject *tag_field, PyObject *cls, bool array_like
         PyObject *key, *val;
         Py_ssize_t pos = 0;
 
+        Py_BEGIN_CRITICAL_SECTION(arg);
         while (PyDict_Next(arg, &pos, &key, &val)) {
             if (!PyUnicode_CheckExact(key)) {
                 PyErr_SetString(PyExc_RuntimeError, "Enum values must be strings");
-                Py_CLEAR(self);
-                goto cleanup;
+                goto cleanup2;
             }
             if (StrLookup_Set(self, key, val) < 0) {
+        cleanup2:
+                EXIT_CRITICAL_SECTION();
                 Py_CLEAR(self);
                 goto cleanup;
             }
         }
+        Py_END_CRITICAL_SECTION();
     }
     else {
         for (Py_ssize_t i = 0; i < nitems; i++) {
@@ -2597,16 +2613,22 @@ AssocList_FromDict(PyObject *dict) {
 
     PyObject *key, *val;
     Py_ssize_t pos = 0;
+    Py_BEGIN_CRITICAL_SECTION(dict);
     while (PyDict_Next(dict, &pos, &key, &val)) {
         if (!PyUnicode_Check(key)) {
             PyErr_SetString(
                 PyExc_TypeError,
                 "Only dicts with str keys are supported when `order` is not `None`"
             );
+            goto error2;
+        }
+        if (AssocList_Append(out, key, val) < 0) {
+    error2:
+            EXIT_CRITICAL_SECTION();
             goto error;
         }
-        if (AssocList_Append(out, key, val) < 0) goto error;
     }
+    Py_END_CRITICAL_SECTION();
     return out;
 error:
     AssocList_Free(out);
@@ -4086,10 +4108,12 @@ typenode_collect_enum(TypeNodeCollectState *state, PyObject *obj) {
         PyObject *key;
         bool all_ints = true;
         bool all_strs = true;
+        Py_BEGIN_CRITICAL_SECTION(members);
         while (PyDict_Next(members, &pos, &key, NULL)) {
             all_ints &= PyLong_CheckExact(key);
             all_strs &= PyUnicode_CheckExact(key);
         }
+        Py_END_CRITICAL_SECTION();
         Py_CLEAR(members);
 
         if (all_ints) {
@@ -4558,11 +4582,14 @@ typenode_collect_convert_structs(TypeNodeCollectState *state) {
     if (PyDict_GET_SIZE(state->mod->struct_lookup_cache) == 64) {
         PyObject *key;
         Py_ssize_t pos = 0;
+        Py_BEGIN_CRITICAL_SECTION(state->mod->struct_lookup_cache);
         if (PyDict_Next(state->mod->struct_lookup_cache, &pos, &key, NULL)) {
             if (PyDict_DelItem(state->mod->struct_lookup_cache, key) < 0) {
+                EXIT_CRITICAL_SECTION();
                 goto cleanup;
             }
         }
+        Py_END_CRITICAL_SECTION();
     }
 
     /* Add the new lookup to the cache */
@@ -5842,11 +5869,14 @@ structmeta_collect_fields(StructMetaInfo *info, MsgspecState *mod, bool kwonly) 
     PyObject *module_ns = NULL;
     PyObject *field, *value;
     Py_ssize_t i = 0;
+    Py_BEGIN_CRITICAL_SECTION(annotations);
     while (PyDict_Next(annotations, &i, &field, &value)) {
         if (!PyUnicode_CheckExact(field)) {
             PyErr_SetString(
                 PyExc_TypeError, "__annotations__ keys must be strings"
             );
+    error2:
+            EXIT_CRITICAL_SECTION();
             goto error;
         }
 
@@ -5860,28 +5890,29 @@ structmeta_collect_fields(StructMetaInfo *info, MsgspecState *mod, bool kwonly) 
                     "Cannot have a struct field named %R",
                     field
                 );
-                goto error;
+                goto error2;
             }
         }
 
         int status = structmeta_is_classvar(info, mod, value, &module_ns);
         if (status == 1) continue;
-        if (status == -1) goto error;
+        if (status == -1) goto error2;
 
         /* If the field is new, add it to slots */
         if (PyDict_GetItem(info->defaults_lk, field) == NULL) {
-            if (PyList_Append(info->slots, field) < 0) goto error;
+            if (PyList_Append(info->slots, field) < 0) goto error2;
         }
 
         if (kwonly) {
-            if (PySet_Add(info->kwonly_fields, field) < 0) goto error;
+            if (PySet_Add(info->kwonly_fields, field) < 0) goto error2;
         }
         else {
-            if (PySet_Discard(info->kwonly_fields, field) < 0) goto error;
+            if (PySet_Discard(info->kwonly_fields, field) < 0) goto error2;
         }
 
-        if (structmeta_process_default(info, field) < 0) goto error;
+        if (structmeta_process_default(info, field) < 0) goto error2;
     }
+    Py_END_CRITICAL_SECTION();
     return 0;
 error:
     Py_XDECREF(module_ns);
@@ -5901,9 +5932,14 @@ structmeta_construct_fields(StructMetaInfo *info, MsgspecState *mod) {
     /* First pass - handle all non-kwonly fields. */
     PyObject *field, *default_val;
     Py_ssize_t pos = 0;
+    Py_BEGIN_CRITICAL_SECTION(info->defaults_lk);
     while (PyDict_Next(info->defaults_lk, &pos, &field, &default_val)) {
         int kwonly = PySet_Contains(info->kwonly_fields, field);
-        if (kwonly < 0) return -1;
+        if (kwonly < 0) {
+    error:
+            EXIT_CRITICAL_SECTION();
+            return -1;
+        }
         if (kwonly) continue;
 
         Py_INCREF(field);
@@ -5918,11 +5954,11 @@ structmeta_construct_fields(StructMetaInfo *info, MsgspecState *mod) {
                     "struct definition.",
                     field
                 );
-                return -1;
+                goto error;
             }
         }
         else {
-            if (PyList_Append(info->defaults, default_val) < 0) return -1;
+            if (PyList_Append(info->defaults, default_val) < 0) goto error;
         }
         field_index++;
     }
@@ -5932,17 +5968,18 @@ structmeta_construct_fields(StructMetaInfo *info, MsgspecState *mod) {
         Py_ssize_t pos = 0;
         while (PyDict_Next(info->defaults_lk, &pos, &field, &default_val)) {
             int kwonly = PySet_Contains(info->kwonly_fields, field);
-            if (kwonly < 0) return -1;
+            if (kwonly < 0) goto error;
             if (!kwonly) continue;
 
             Py_INCREF(field);
             PyTuple_SET_ITEM(info->fields, field_index, field);
             if (PyList_GET_SIZE(info->defaults) || default_val != NODEFAULT) {
-                if (PyList_Append(info->defaults, default_val) < 0) return -1;
+                if (PyList_Append(info->defaults, default_val) < 0) goto error;
             }
             field_index++;
         }
     }
+    Py_END_CRITICAL_SECTION();
 
     /* Convert defaults list to tuple */
     PyObject *temp_defaults = PyList_AsTuple(info->defaults);
@@ -8267,17 +8304,23 @@ TypedDictInfo_Convert(PyObject *obj) {
     /* Traverse fields and initialize TypedDictInfo */
     Py_ssize_t pos = 0, i = 0;
     PyObject *key, *val;
+    Py_BEGIN_CRITICAL_SECTION(annotations);
     while (PyDict_Next(annotations, &pos, &key, &val)) {
         TypeNode *type = TypeNode_Convert(val);
-        if (type == NULL) goto cleanup;
+        if (type == NULL) {
+    cleanup2:
+            EXIT_CRITICAL_SECTION();
+            goto cleanup;
+        }
         Py_INCREF(key);
         info->fields[i].key = key;
         info->fields[i].type = type;
         int contains = PySet_Contains(required, key);
-        if (contains == -1) goto cleanup;
+        if (contains == -1) goto cleanup2;
         if (contains) { type->types |= MS_EXTRA_FLAG; }
         i++;
     }
+    Py_END_CRITICAL_SECTION();
     info->nrequired = PySet_GET_SIZE(required);
 
     PyObject_GC_Track(info);
@@ -9044,12 +9087,16 @@ AssocList_FromDataclass(PyObject *obj, PyObject *fields)
     if (out == NULL) goto cleanup;
 
     PyObject *field, *val;
+    Py_BEGIN_CRITICAL_SECTION2(iter.fields, iter.dict);
     while (dataclass_iter_next(&iter, &field, &val)) {
         int status = AssocList_Append(out, field, val);
         Py_DECREF(val);
-        if (status < 0) goto cleanup;
+        if (status < 0) goto cleanup2;
     }
     ok = true;
+
+cleanup2:
+    Py_END_CRITICAL_SECTION2();
 
 cleanup:
     Py_LeaveRecursiveCall();
@@ -9093,16 +9140,22 @@ AssocList_FromObject(PyObject *obj) {
     if (dict != NULL) {
         PyObject *key, *val;
         Py_ssize_t pos = 0;
+        Py_BEGIN_CRITICAL_SECTION(dict);
         while (PyDict_Next(dict, &pos, &key, &val)) {
             if (MS_LIKELY(PyUnicode_CheckExact(key))) {
                 Py_ssize_t key_len;
                 if (MS_UNLIKELY(val == UNSET)) continue;
                 const char* key_buf = unicode_str_and_size(key, &key_len);
-                if (MS_UNLIKELY(key_buf == NULL)) goto cleanup;
+                if (MS_UNLIKELY(key_buf == NULL)) {
+        cleanup2:
+                    EXIT_CRITICAL_SECTION();
+                    goto cleanup;
+                }
                 if (MS_UNLIKELY(*key_buf == '_')) continue;
-                if (MS_UNLIKELY(AssocList_Append(out, key, val) < 0)) goto cleanup;
+                if (MS_UNLIKELY(AssocList_Append(out, key, val) < 0)) goto cleanup2;
             }
         }
+        Py_END_CRITICAL_SECTION();
     }
     /* Then append everything in slots */
     type = Py_TYPE(obj);
@@ -9396,9 +9449,6 @@ encoder_encode_into_common(
         }
     }
 
-    Py_INCREF(obj);
-    Py_INCREF(buf);
-
     /* Setup buffer */
     EncoderState state = {
         .mod = self->mod,
@@ -9413,13 +9463,9 @@ encoder_encode_into_common(
         .resize_buffer = ms_resize_bytearray
     };
     if (encode(&state, obj) < 0) {
-        Py_DECREF(buf);
-        Py_DECREF(obj);
         return NULL;
     }
     FAST_BYTEARRAY_SHRINK(buf, state.output_len);
-    Py_DECREF(buf);
-    Py_DECREF(obj);
     Py_RETURN_NONE;
 }
 
@@ -9463,13 +9509,10 @@ encoder_encode_common(
     if (state.output_buffer == NULL) return NULL;
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
-    Py_INCREF(args[0]);
     if (encode(&state, args[0]) < 0) {
-        Py_DECREF(args[0]);
         Py_DECREF(state.output_buffer);
         return NULL;
     }
-    Py_DECREF(args[0]);
     FAST_BYTES_SHRINK(state.output_buffer, state.output_len);
     return state.output_buffer;
 }
@@ -9526,13 +9569,10 @@ encode_common(
     if (state.output_buffer == NULL) return NULL;
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
-    Py_INCREF(args[0]);
     if (encode(&state, args[0]) < 0) {
-        Py_DECREF(args[0]);
         Py_DECREF(state.output_buffer);
         return NULL;
     }
-    Py_DECREF(args[0]);
     FAST_BYTES_SHRINK(state.output_buffer, state.output_len);
     return state.output_buffer;
 }
@@ -12432,12 +12472,14 @@ mpack_encode_list(EncoderState *self, PyObject *obj)
 
     if (mpack_encode_array_header(self, len, "list") < 0) return -1;
     if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     for (i = 0; i < len; i++) {
         if (mpack_encode_inline(self, PyList_GET_ITEM(obj, i)) < 0) {
             status = -1;
             break;
         }
     }
+    Py_END_CRITICAL_SECTION();
     Py_LeaveRecursiveCall();
     return status;
 }
@@ -12578,12 +12620,14 @@ mpack_encode_dict(EncoderState *self, PyObject *obj)
 
     if (mpack_encode_map_header(self, len, "dicts") < 0) return -1;
     if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     while (PyDict_Next(obj, &pos, &key, &val)) {
         if (mpack_encode_dict_key_inline(self, key) < 0) goto cleanup;
         if (mpack_encode_inline(self, val) < 0) goto cleanup;
     }
     status = 0;
 cleanup:
+    Py_END_CRITICAL_SECTION();
     Py_LeaveRecursiveCall();
     return status;
 }
@@ -12608,18 +12652,22 @@ mpack_encode_dataclass(EncoderState *self, PyObject *obj, PyObject *fields)
 
     Py_ssize_t size = 0;
     PyObject *field, *val;
+    bool errored = false;
+    Py_BEGIN_CRITICAL_SECTION2(iter.fields, iter.dict);
     while (dataclass_iter_next(&iter, &field, &val)) {
         size++;
         Py_ssize_t field_len;
         const char* field_buf = unicode_str_and_size(field, &field_len);
-        bool errored = (
+        errored = (
             (field_buf == NULL) ||
             (mpack_encode_cstr(self, field_buf, field_len) < 0) ||
             (mpack_encode(self, val) < 0)
         );
         Py_DECREF(val);
-        if (errored) goto cleanup;
+        if (errored) break;
     }
+    Py_END_CRITICAL_SECTION2();
+    if (errored) goto cleanup;
 
     if (MS_UNLIKELY(size != max_size)) {
         /* Some fields were skipped, need to adjust header. We write the header
@@ -12685,18 +12733,24 @@ mpack_encode_object(EncoderState *self, PyObject *obj)
     if (dict != NULL) {
         PyObject *key, *val;
         Py_ssize_t pos = 0;
+        Py_BEGIN_CRITICAL_SECTION(dict);
         while (PyDict_Next(dict, &pos, &key, &val)) {
             if (MS_LIKELY(PyUnicode_CheckExact(key))) {
                 Py_ssize_t key_len;
                 if (MS_UNLIKELY(val == UNSET)) continue;
                 const char* key_buf = unicode_str_and_size(key, &key_len);
-                if (MS_UNLIKELY(key_buf == NULL)) goto cleanup;
+                if (MS_UNLIKELY(key_buf == NULL)) goto cleanup2;
                 if (MS_UNLIKELY(*key_buf == '_')) continue;
-                if (MS_UNLIKELY(mpack_encode_cstr(self, key_buf, key_len) < 0)) goto cleanup;
-                if (MS_UNLIKELY(mpack_encode(self, val) < 0)) goto cleanup;
+                if (MS_UNLIKELY(mpack_encode_cstr(self, key_buf, key_len) < 0)) goto cleanup2;
+                if (MS_UNLIKELY(mpack_encode(self, val) < 0)) {
+        cleanup2:
+                    EXIT_CRITICAL_SECTION();
+                    goto cleanup;
+                }
                 size++;
             }
         }
+        Py_END_CRITICAL_SECTION();
     }
     /* Then encode everything in slots */
     type = Py_TYPE(obj);
@@ -13919,6 +13973,7 @@ json_encode_dict(EncoderState *self, PyObject *obj)
 
     if (ms_write(self, "{", 1) < 0) return -1;
     if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     while (PyDict_Next(obj, &pos, &key, &val)) {
         if (json_encode_dict_key(self, key) < 0) goto cleanup;
         if (ms_write(self, ":", 1) < 0) goto cleanup;
@@ -13929,6 +13984,7 @@ json_encode_dict(EncoderState *self, PyObject *obj)
     *(self->output_buffer_raw + self->output_len - 1) = '}';
     status = 0;
 cleanup:
+    Py_END_CRITICAL_SECTION();
     Py_LeaveRecursiveCall();
     return status;
 }
@@ -13952,10 +14008,12 @@ json_encode_dataclass(EncoderState *self, PyObject *obj, PyObject *fields)
     Py_ssize_t start_offset = self->output_len;
 
     PyObject *field, *val;
+    bool errored = false;
+    Py_BEGIN_CRITICAL_SECTION2(iter.fields, iter.dict);
     while (dataclass_iter_next(&iter, &field, &val)) {
         Py_ssize_t field_len;
         const char* field_buf = unicode_str_and_size(field, &field_len);
-        bool errored = (
+        errored = (
             (field_buf == NULL) ||
             (json_encode_cstr_noescape(self, field_buf, field_len) < 0) ||
             (ms_write(self, ":", 1) < 0) ||
@@ -13963,8 +14021,10 @@ json_encode_dataclass(EncoderState *self, PyObject *obj, PyObject *fields)
             (ms_write(self, ",", 1) < 0)
         );
         Py_DECREF(val);
-        if (errored) goto cleanup;
+        if (errored) break;
     }
+    Py_END_CRITICAL_SECTION2();
+    if (errored) goto cleanup;
 
     /* If any fields written, overwrite trailing comma with }, otherwise append } */
     if (MS_LIKELY(self->output_len != start_offset)) {
@@ -14004,19 +14064,25 @@ json_encode_object(EncoderState *self, PyObject *obj)
     else {
         PyObject *key, *val;
         Py_ssize_t pos = 0;
+        Py_BEGIN_CRITICAL_SECTION(dict);
         while (PyDict_Next(dict, &pos, &key, &val)) {
             if (MS_LIKELY(PyUnicode_CheckExact(key))) {
                 Py_ssize_t key_len;
                 const char* key_buf = unicode_str_and_size(key, &key_len);
                 if (MS_UNLIKELY(val == UNSET)) continue;
-                if (MS_UNLIKELY(key_buf == NULL)) goto cleanup;
+                if (MS_UNLIKELY(key_buf == NULL)) goto cleanup2;
                 if (MS_UNLIKELY(*key_buf == '_')) continue;
-                if (MS_UNLIKELY(json_encode_cstr_noescape(self, key_buf, key_len) < 0)) goto cleanup;
-                if (MS_UNLIKELY(ms_write(self, ":", 1) < 0)) goto cleanup;
-                if (MS_UNLIKELY(json_encode(self, val) < 0)) goto cleanup;
-                if (MS_UNLIKELY(ms_write(self, ",", 1) < 0)) goto cleanup;
+                if (MS_UNLIKELY(json_encode_cstr_noescape(self, key_buf, key_len) < 0)) goto cleanup2;
+                if (MS_UNLIKELY(ms_write(self, ":", 1) < 0)) goto cleanup2;
+                if (MS_UNLIKELY(json_encode(self, val) < 0)) goto cleanup2;
+                if (MS_UNLIKELY(ms_write(self, ",", 1) < 0)) {
+        cleanup2:
+                    EXIT_CRITICAL_SECTION();
+                    goto cleanup;
+                }
             }
         }
+        Py_END_CRITICAL_SECTION();
     }
     /* Then encode everything in slots */
     PyTypeObject *type = Py_TYPE(obj);
@@ -14345,12 +14411,17 @@ JSONEncoder_encode_lines(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
     PyObject *input = args[0];
-    Py_INCREF(input);
     if (MS_LIKELY(PyList_Check(input))) {
+        Py_BEGIN_CRITICAL_SECTION(input);
         for (Py_ssize_t i = 0; i < PyList_GET_SIZE(input); i++) {
-            if (json_encode(&state, PyList_GET_ITEM(input, i)) < 0) goto error;
-            if (ms_write(&state, "\n", 1) < 0) goto error;
+            if (json_encode(&state, PyList_GET_ITEM(input, i)) < 0) goto error2;
+            if (ms_write(&state, "\n", 1) < 0) {
+        error2:
+                EXIT_CRITICAL_SECTION();
+                goto error;
+            }
         }
+        Py_END_CRITICAL_SECTION();
     }
     else {
         PyObject *iter = PyObject_GetIter(input);
@@ -14363,13 +14434,11 @@ JSONEncoder_encode_lines(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
         }
         if (PyErr_Occurred()) goto error;
     }
-    Py_DECREF(input);
 
     FAST_BYTES_SHRINK(state.output_buffer, state.output_len);
     return state.output_buffer;
 
 error:
-    Py_DECREF(input);
     Py_DECREF(state.output_buffer);
     return NULL;
 }
@@ -16151,7 +16220,6 @@ Decoder_decode(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
 
     Py_buffer buffer;
     buffer.buf = NULL;
-    Py_INCREF(args[0]);
     if (PyObject_GetBuffer(args[0], &buffer, PyBUF_CONTIG_RO) >= 0) {
         state.buffer_obj = args[0];
         state.input_start = buffer.buf;
@@ -16165,10 +16233,8 @@ Decoder_decode(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
         }
 
         PyBuffer_Release(&buffer);
-        Py_DECREF(args[0]);
         return res;
     }
-    Py_DECREF(args[0]);
     return NULL;
 }
 
@@ -16332,7 +16398,6 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
 
     Py_buffer buffer;
     buffer.buf = NULL;
-    Py_INCREF(buf);
     if (PyObject_GetBuffer(buf, &buffer, PyBUF_CONTIG_RO) >= 0) {
         state.buffer_obj = buf;
         state.input_start = buffer.buf;
@@ -16344,7 +16409,6 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
             Py_CLEAR(res);
         }
     }
-    Py_DECREF(buf);
 
     if (state.type == (TypeNode *)&typenode_struct) {
         Py_DECREF(typenode_struct.details[0].pointer);
@@ -19105,7 +19169,6 @@ JSONDecoder_decode(JSONDecoder *self, PyObject *const *args, Py_ssize_t nargs)
 
     Py_buffer buffer;
     buffer.buf = NULL;
-    Py_INCREF(args[0]);
     if (ms_get_buffer(args[0], &buffer) >= 0) {
 
         state.buffer_obj = args[0];
@@ -19122,10 +19185,8 @@ JSONDecoder_decode(JSONDecoder *self, PyObject *const *args, Py_ssize_t nargs)
         ms_release_buffer(&buffer);
 
         PyMem_Free(state.scratch);
-        Py_DECREF(args[0]);
         return res;
     }
-    Py_DECREF(args[0]);
 
     return NULL;
 }
@@ -19175,7 +19236,6 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
 
     Py_buffer buffer;
     buffer.buf = NULL;
-    Py_INCREF(args[0]);
     if (ms_get_buffer(args[0], &buffer) >= 0) {
 
         state.buffer_obj = args[0];
@@ -19186,7 +19246,7 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
         PathNode path = {NULL, 0, NULL};
 
         PyObject *out = PyList_New(0);
-        if (out == NULL) goto done2;
+        if (out == NULL) return NULL;
         while (true) {
             /* Skip until first non-whitespace character, or return if buffer
              * exhausted */
@@ -19220,11 +19280,8 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
         ms_release_buffer(&buffer);
 
         PyMem_Free(state.scratch);
-    done2:
-        Py_DECREF(args[0]);
         return out;
     }
-    Py_DECREF(args[0]);
 
     return NULL;
 }
@@ -19374,7 +19431,6 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
 
     Py_buffer buffer;
     buffer.buf = NULL;
-    Py_INCREF(buf);
     if (ms_get_buffer(buf, &buffer) >= 0) {
         state.buffer_obj = buf;
         state.input_start = buffer.buf;
@@ -19389,7 +19445,6 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
 
         ms_release_buffer(&buffer);
     }
-    Py_DECREF(buf);
 
     PyMem_Free(state.scratch);
 
@@ -19512,7 +19567,8 @@ to_builtins_list(ToBuiltinsState *self, PyObject *obj) {
 
     Py_ssize_t size = PyList_GET_SIZE(obj);
     PyObject *out = PyList_New(size);
-    if (out == NULL) goto cleanup;
+    if (out == NULL) goto cleanup2;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     for (Py_ssize_t i = 0; i < size; i++) {
         PyObject *item = PyList_GET_ITEM(obj, i);
         PyObject *new = to_builtins(self, item, false);
@@ -19522,8 +19578,10 @@ to_builtins_list(ToBuiltinsState *self, PyObject *obj) {
         }
         PyList_SET_ITEM(out, i, new);
     }
-
 cleanup:
+    Py_END_CRITICAL_SECTION();
+
+cleanup2:
     Py_LeaveRecursiveCall();
     return out;
 }
@@ -19555,11 +19613,12 @@ to_builtins_set(ToBuiltinsState *self, PyObject *obj, bool is_key) {
     if (Py_EnterRecursiveCall(" while serializing an object")) return NULL;
 
     PyObject *list = PySequence_List(obj);
-    if (list == NULL) goto cleanup;
+    if (list == NULL) goto cleanup2;
     if (self->order != ORDER_DEFAULT) {
-        if (PyList_Sort(list) < 0) goto cleanup;
+        if (PyList_Sort(list) < 0) goto cleanup2;
     }
 
+    Py_BEGIN_CRITICAL_SECTION(list);
     Py_ssize_t size = PyList_GET_SIZE(list);
     for (Py_ssize_t i = 0; i < size; i++) {
         PyObject *orig_item = PyList_GET_ITEM(list, i);
@@ -19575,8 +19634,10 @@ to_builtins_set(ToBuiltinsState *self, PyObject *obj, bool is_key) {
         Py_INCREF(list);
         out = list;
     }
-
 cleanup:
+    Py_END_CRITICAL_SECTION();
+
+cleanup2:
     Py_LeaveRecursiveCall();
     Py_XDECREF(list);
     return out;
@@ -19587,8 +19648,9 @@ sort_dict_inplace(PyObject **dict) {
     PyObject *out = NULL, *new = NULL, *keys = NULL;
 
     new = PyDict_New();
-    if (new == NULL) goto error;
+    if (new == NULL) goto error2;
 
+    Py_BEGIN_CRITICAL_SECTION(*dict);
     keys = PyDict_Keys(*dict);
     if (keys == NULL) goto error;
     if (PyList_Sort(keys) < 0) goto error;
@@ -19603,6 +19665,8 @@ sort_dict_inplace(PyObject **dict) {
     Py_INCREF(new);
     out = new;
 error:
+    Py_END_CRITICAL_SECTION();
+error2:
     Py_XDECREF(new);
     Py_XDECREF(keys);
     Py_XDECREF(*dict);
@@ -19619,13 +19683,14 @@ to_builtins_dict(ToBuiltinsState *self, PyObject *obj) {
     if (out == NULL) goto cleanup;
 
     Py_ssize_t pos = 0;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     while (PyDict_Next(obj, &pos, &key, &val)) {
         new_key = to_builtins(self, key, true);
-        if (new_key == NULL) goto cleanup;
+        if (new_key == NULL) goto cleanup2;
         if (self->str_keys) {
             if (PyLong_CheckExact(new_key) || PyFloat_CheckExact(new_key)) {
                 PyObject *temp = PyObject_Str(new_key);
-                if (temp == NULL) goto cleanup;
+                if (temp == NULL) goto cleanup2;
                 Py_DECREF(new_key);
                 new_key = temp;
             }
@@ -19634,15 +19699,20 @@ to_builtins_dict(ToBuiltinsState *self, PyObject *obj) {
                     PyExc_TypeError,
                     "Only dicts with str-like or number-like keys are supported"
                 );
-                goto cleanup;
+                goto cleanup2;
             }
         }
         new_val = to_builtins(self, val, false);
-        if (new_val == NULL) goto cleanup;
-        if (PyDict_SetItem(out, new_key, new_val) < 0) goto cleanup;
+        if (new_val == NULL) goto cleanup2;
+        if (PyDict_SetItem(out, new_key, new_val) < 0) {
+    cleanup2:
+            EXIT_CRITICAL_SECTION();
+            goto cleanup;
+        }
         Py_CLEAR(new_key);
         Py_CLEAR(new_val);
     }
+    Py_END_CRITICAL_SECTION();
     if (MS_UNLIKELY(self->order != ORDER_DEFAULT)) {
         sort_dict_inplace(&out);
     }
@@ -19757,16 +19827,20 @@ to_builtins_dataclass(ToBuiltinsState *self, PyObject *obj, PyObject *fields)
     out = PyDict_New();
     if (out == NULL) goto cleanup;
 
+    int status = 0;
     PyObject *field, *val;
+    Py_BEGIN_CRITICAL_SECTION2(iter.fields, iter.dict);
     while (dataclass_iter_next(&iter, &field, &val)) {
         PyObject *val2 = to_builtins(self, val, false);
-        int status = (
+        status = (
             (val2 == NULL) ? -1 : PyDict_SetItem(out, field, val2)
         );
         Py_DECREF(val);
         Py_XDECREF(val2);
-        if (status < 0) goto cleanup;
+        if (status < 0) break;
     }
+    Py_END_CRITICAL_SECTION2();
+    if (status < 0) goto cleanup;
     if (MS_UNLIKELY(self->order == ORDER_SORTED)) {
         sort_dict_inplace(&out);
     }
@@ -19799,21 +19873,27 @@ to_builtins_object(ToBuiltinsState *self, PyObject *obj) {
     else {
         PyObject *key, *val;
         Py_ssize_t pos = 0;
+        Py_BEGIN_CRITICAL_SECTION(dict);
         while (PyDict_Next(dict, &pos, &key, &val)) {
             if (MS_LIKELY(PyUnicode_CheckExact(key))) {
                 Py_ssize_t key_len;
                 if (MS_UNLIKELY(val == UNSET)) continue;
                 const char* key_buf = unicode_str_and_size(key, &key_len);
-                if (MS_UNLIKELY(key_buf == NULL)) goto cleanup;
+                if (MS_UNLIKELY(key_buf == NULL)) goto cleanup2;
                 if (MS_UNLIKELY(*key_buf == '_')) continue;
 
                 PyObject *val2 = to_builtins(self, val, false);
-                if (val2 == NULL) goto cleanup;
+                if (val2 == NULL) goto cleanup2;
                 int status = PyDict_SetItem(out, key, val2);
                 Py_DECREF(val2);
-                if (status < 0) goto cleanup;
+                if (status < 0) {
+        cleanup2:
+                    EXIT_CRITICAL_SECTION();
+                    goto cleanup;
+                }
             }
         }
+        Py_END_CRITICAL_SECTION();
     }
     /* Then encode everything in slots */
     PyTypeObject *type = Py_TYPE(obj);
@@ -20170,9 +20250,7 @@ msgspec_to_builtins(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    Py_INCREF(obj);
     PyObject *out = to_builtins(&state, obj, false);
-    Py_DECREF(obj);
     Py_XDECREF(state.builtin_types_seq);
     return out;
 }
@@ -21037,6 +21115,7 @@ convert_dict_to_dict(
     }
     PyObject *key_obj = NULL, *val_obj = NULL;
     Py_ssize_t pos = 0;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     while (PyDict_Next(obj, &pos, &key_obj, &val_obj)) {
         PyObject *key;
         if (PyUnicode_CheckExact(key_obj)) {
@@ -21045,17 +21124,22 @@ convert_dict_to_dict(
         else {
             key = convert(self, key_obj, key_type, &key_path);
         }
-        if (MS_UNLIKELY(key == NULL)) goto error;
+        if (MS_UNLIKELY(key == NULL)) goto error2;
         PyObject *val = convert(self, val_obj, val_type, &val_path);
         if (MS_UNLIKELY(val == NULL)) {
             Py_DECREF(key);
-            goto error;
+            goto error2;
         }
         int status = PyDict_SetItem(out, key, val);
         Py_DECREF(key);
         Py_DECREF(val);
-        if (status < 0) goto error;
+        if (status < 0) {
+    error2:
+            EXIT_CRITICAL_SECTION();
+            goto error;
+        }
     }
+    Py_END_CRITICAL_SECTION();
     Py_LeaveRecursiveCall();
     return out;
 error:
@@ -21101,12 +21185,17 @@ convert_dict_to_struct(
 
     Py_ssize_t pos = 0, pos_obj = 0;
     PyObject *key_obj, *val_obj;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     while (PyDict_Next(obj, &pos_obj, &key_obj, &val_obj)) {
-        if (!convert_is_str_key(key_obj, path)) goto error;
+        if (!convert_is_str_key(key_obj, path)) {
+    error2:
+            EXIT_CRITICAL_SECTION();
+            goto error;
+        }
 
         Py_ssize_t key_size;
         const char *key = unicode_str_and_size(key_obj, &key_size);
-        if (key == NULL) goto error;
+        if (key == NULL) goto error2;
 
         Py_ssize_t field_index = StructMeta_get_field_index(struct_type, key, key_size, &pos);
         if (field_index < 0) {
@@ -21118,14 +21207,14 @@ convert_dict_to_struct(
                         self, val_obj, struct_type->struct_tag_value, &tag_path
                     )
                 ) {
-                    goto error;
+                    goto error2;
                 }
             }
             else {
                 /* Unknown field */
                 if (MS_UNLIKELY(struct_type->forbid_unknown_fields == OPT_TRUE)) {
                     ms_error_unknown_field(key, key_size, path);
-                    goto error;
+                    goto error2;
                 }
             }
         }
@@ -21134,10 +21223,11 @@ convert_dict_to_struct(
             PyObject *val = convert(
                 self, val_obj, info->types[field_index], &field_path
             );
-            if (val == NULL) goto error;
+            if (val == NULL) goto error2;
             Struct_set_index(out, field_index, val);
         }
     }
+    Py_END_CRITICAL_SECTION();
 
     if (Struct_fill_in_defaults(struct_type, out, path) < 0) goto error;
     Py_LeaveRecursiveCall();
@@ -21179,12 +21269,13 @@ convert_dict_to_typeddict(
     TypedDictInfo *info = TypeNode_get_typeddict_info(type);
     Py_ssize_t nrequired = 0, pos = 0, pos_obj = 0;
     PyObject *key_obj, *val_obj;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     while (PyDict_Next(obj, &pos_obj, &key_obj, &val_obj)) {
-        if (!convert_is_str_key(key_obj, path)) goto error;
+        if (!convert_is_str_key(key_obj, path)) goto error2;
 
         Py_ssize_t key_size;
         const char *key = unicode_str_and_size(key_obj, &key_size);
-        if (key == NULL) goto error;
+        if (key == NULL) goto error2;
 
         TypeNode *field_type;
         PyObject *field = TypedDictInfo_lookup_key(
@@ -21194,12 +21285,17 @@ convert_dict_to_typeddict(
             if (field_type->types & MS_EXTRA_FLAG) nrequired++;
             PathNode field_path = {path, PATH_STR, field};
             PyObject *val = convert(self, val_obj, field_type, &field_path);
-            if (val == NULL) goto error;
+            if (val == NULL) goto error2;
             int status = PyDict_SetItem(out, field, val);
             Py_DECREF(val);
-            if (status < 0) goto error;
+            if (status < 0) {
+    error2:
+                EXIT_CRITICAL_SECTION();
+                goto error;
+            }
         }
     }
+    Py_END_CRITICAL_SECTION();
     if (nrequired < info->nrequired) {
         /* A required field is missing, determine which one and raise */
         TypedDictInfo_error_missing(info, out, path);
@@ -21232,11 +21328,16 @@ convert_dict_to_dataclass(
 
     Py_ssize_t pos = 0, pos_obj = 0;
     PyObject *key_obj = NULL, *val_obj = NULL;
+    Py_BEGIN_CRITICAL_SECTION(obj);
     while (PyDict_Next(obj, &pos_obj, &key_obj, &val_obj)) {
-        if (!convert_is_str_key(key_obj, path)) goto error;
+        if (!convert_is_str_key(key_obj, path)) {
+    error2:
+            EXIT_CRITICAL_SECTION();
+            goto error;
+        }
         Py_ssize_t key_size;
         const char *key = unicode_str_and_size(key_obj, &key_size);
-        if (MS_UNLIKELY(key == NULL)) goto error;
+        if (MS_UNLIKELY(key == NULL)) goto error2;
 
         TypeNode *field_type;
         PyObject *field = DataclassInfo_lookup_key(
@@ -21245,12 +21346,13 @@ convert_dict_to_dataclass(
         if (field != NULL) {
             PathNode field_path = {path, PATH_STR, field};
             PyObject *val = convert(self, val_obj, field_type, &field_path);
-            if (val == NULL) goto error;
+            if (val == NULL) goto error2;
             int status = PyObject_GenericSetAttr(out, field, val);
             Py_DECREF(val);
-            if (status < 0) goto error;
+            if (status < 0) goto error2;
         }
     }
+    Py_END_CRITICAL_SECTION();
     if (DataclassInfo_post_decode(info, out, path) < 0) goto error;
     Py_LeaveRecursiveCall();
     return out;
@@ -21800,31 +21902,22 @@ msgspec_convert(PyObject *self, PyObject *args, PyObject *kwargs)
     }
     state.dec_hook = dec_hook;
 
-    Py_INCREF(obj);
     /* Avoid allocating a new TypeNode for struct types */
     if (Py_TYPE(pytype) == &StructMetaType) {
         PyObject *info = StructInfo_Convert(pytype);
-        if (info == NULL) {
-            Py_DECREF(obj);
-            return NULL;
-        }
+        if (info == NULL) return NULL;
         bool array_like = ((StructMetaObject *)pytype)->array_like == OPT_TRUE;
         TypeNodeSimple type;
         type.types = array_like ? MS_TYPE_STRUCT_ARRAY : MS_TYPE_STRUCT;
         type.details[0].pointer = info;
         PyObject *out = convert(&state, obj, (TypeNode *)(&type), NULL);
         Py_DECREF(info);
-        Py_DECREF(obj);
         return out;
     }
 
     TypeNode *type = TypeNode_Convert(pytype);
-    if (type == NULL) {
-        Py_DECREF(obj);
-        return NULL;
-    }
+    if (type == NULL) return NULL;
     PyObject *out = convert(&state, obj, type, NULL);
-    Py_DECREF(obj);
     TypeNode_Free(type);
     return out;
 }
