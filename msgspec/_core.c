@@ -12607,28 +12607,34 @@ mpack_encode_dict(EncoderState *self, PyObject *obj)
     Py_ssize_t pos = 0;
     int status = -1;
 
+    Py_BEGIN_CRITICAL_SECTION(obj);
     Py_ssize_t len = PyDict_GET_SIZE(obj);
 
     if (MS_UNLIKELY(len == 0)) {
         char header[1] = {MP_FIXMAP};
+	EXIT_CRITICAL_SECTION();
         return ms_write(self, header, 1);
     }
 
     if (MS_UNLIKELY(self->order != ORDER_DEFAULT)) {
+	EXIT_CRITICAL_SECTION();
         return mpack_encode_and_free_assoclist(self, AssocList_FromDict(obj));
     }
 
-    if (mpack_encode_map_header(self, len, "dicts") < 0) return -1;
-    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
-    Py_BEGIN_CRITICAL_SECTION(obj);
+    if (mpack_encode_map_header(self, len, "dicts") < 0) {
+error:
+	EXIT_CRITICAL_SECTION();
+	return -1;
+    }
+    if (Py_EnterRecursiveCall(" while serializing an object")) goto error;
     while (PyDict_Next(obj, &pos, &key, &val)) {
         if (mpack_encode_dict_key_inline(self, key) < 0) goto cleanup;
         if (mpack_encode_inline(self, val) < 0) goto cleanup;
     }
     status = 0;
 cleanup:
-    Py_END_CRITICAL_SECTION();
     Py_LeaveRecursiveCall();
+    Py_END_CRITICAL_SECTION();
     return status;
 }
 
